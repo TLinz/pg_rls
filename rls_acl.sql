@@ -16,11 +16,42 @@ CREATE TABLE t_creation (
     acl ace_uuid[]
 );
 
+CREATE FUNCTION creation_modify()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_parent_acl ace_uuid[];
+BEGIN
+  -- SELECT acl INTO v_parent_acl FROM t_artist WHERE id = NEW.artist_id; -- bug! [22P02] ERROR: missing "=" sign
+  raise notice 'new artist id is %', NEW.artist_id;
+  v_parent_acl = (SELECT p.acl FROM t_artist p WHERE p.id = NEW.artist_id);
+  -- v_parent_acl = '314d6bee-42a0-4254-a00d-7362c793a897'::UUID;
+  IF v_parent_acl IS NULL THEN
+    NEW.acl = NULL;
+  ELSE
+    IF NEW.acl IS NULL THEN
+      NEW.acl = v_parent_acl;
+    ELSE
+      NEW.acl = acl_merge(v_parent_acl, NEW.acl, true, true);
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER creation_insert
+BEFORE INSERT OR UPDATE ON t_creation
+FOR EACH ROW EXECUTE PROCEDURE creation_modify();
+
+commit;
+
+
 ALTER TABLE t_creation ADD CONSTRAINT fk_artist
 FOREIGN KEY (artist_id)
 REFERENCES t_artist(id);
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON t_creation TO PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON t_artist TO PUBLIC;
 
 ALTER TABLE t_creation ENABLE ROW LEVEL SECURITY;
 
@@ -42,13 +73,23 @@ INSERT INTO t_artist(name) values ('Alice');
 -- super user will bypass rls...
 SET ROLE app_user;
 
+-- There's an issue about inserting.
+-- See https://community.flutterflow.io/database-and-apis/post/supabase-insert-row-error-22p02-iH9f0YnbfBVoOnD
+
 BEGIN;
 --  PostgresSQL scopes these variables to the current session
-SET LOCAL app_user.uuid = '10fc1485-7cc2-42ac-a896-1ac370f5401e';
+-- SET LOCAL app_user.uuid = '314d6bee-42a0-4254-a00d-7362c793a897';
+-- INSERT INTO t_creation(id, artist_id, name, acl) values
+--     (0, '314d6bee-42a0-4254-a00d-7362c793a897', 'Happy Life', '{a//314d6bee-42a0-4254-a00d-7362c793a897=rw}');
+-- INSERT INTO t_creation(id, artist_id, name, acl) values
+--     (1, '314d6bee-42a0-4254-a00d-7362c793a897', 'Sad Life', '{a//314d6bee-42a0-4254-a00d-7362c793a897=rw}');
+-- COMMIT;
+
+SET LOCAL app_user.uuid = '314d6bee-42a0-4254-a00d-7362c793a897';
 INSERT INTO t_creation(id, artist_id, name, acl) values
-    (0, '10fc1485-7cc2-42ac-a896-1ac370f5401e', 'Happy Life', '{a//10fc1485-7cc2-42ac-a896-1ac370f5401e=rw}');
+    (0, '314d6bee-42a0-4254-a00d-7362c793a897', 'Happy Life', '{a//314d6bee-42a0-4254-a00d-7362c793a897=w}');
 INSERT INTO t_creation(id, artist_id, name, acl) values
-    (1, '10fc1485-7cc2-42ac-a896-1ac370f5401e', 'Sad Life', '{a//10fc1485-7cc2-42ac-a896-1ac370f5401e=rw}');
+    (1, '314d6bee-42a0-4254-a00d-7362c793a897', 'Sad Life', '{a//314d6bee-42a0-4254-a00d-7362c793a897=dw}');
 COMMIT;
 
 BEGIN;
@@ -229,3 +270,105 @@ EXECUTE FUNCTION maintain_user_group_consistency();
 --
 -- -- Create a GIN index using the comparison function
 -- CREATE INDEX acl_uuid_gin_index ON t_creation USING GIN (acl);
+
+CREATE TABLE t_user_group_hierarchy (
+    user_id UUID NOT NULL,
+    group_id UUID NOT NULL,
+    PRIMARY KEY (user_id, group_id),
+    FOREIGN KEY (user_id) REFERENCES t_artist(id),
+    FOREIGN KEY (group_id) REFERENCES t_group(id)
+);
+
+CREATE OR REPLACE FUNCTION sync_user_group_hierarchy()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_group_id UUID;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        WITH RECURSIVE group_hierarchy AS (
+            SELECT id, parent_id
+            FROM t_group
+            WHERE id = NEW.group_id
+
+            UNION ALL
+
+            SELECT g.id, g.parent_id
+            FROM t_group g
+            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
+        )
+        INSERT INTO t_user_group_hierarchy (user_id, group_id)
+        SELECT ug.user_id, gh.id
+        FROM t_user_group ug, group_hierarchy gh
+        WHERE ug.group_id = NEW.group_id;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        WITH RECURSIVE group_hierarchy AS (
+            SELECT id, parent_id
+            FROM t_group
+            WHERE id = OLD.group_id
+
+            UNION ALL
+
+            SELECT g.id, g.parent_id
+            FROM t_group g
+            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
+        )
+        DELETE FROM t_user_group_hierarchy
+        WHERE user_id = OLD.user_id
+        AND group_id IN (SELECT id FROM group_hierarchy);
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER sync_user_group_hierarchy_trigger
+AFTER INSERT OR DELETE ON t_user_group
+FOR EACH ROW EXECUTE FUNCTION sync_user_group_hierarchy();
+
+CREATE OR REPLACE FUNCTION maintain_group_hierarchy_consistency()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        WITH RECURSIVE group_hierarchy AS (
+            SELECT id, parent_id
+            FROM t_group
+            WHERE id = NEW.id
+
+            UNION ALL
+
+            SELECT g.id, g.parent_id
+            FROM t_group g
+            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
+        )
+        INSERT INTO t_user_group_hierarchy (user_id, group_id)
+        SELECT ug.user_id, gh.id
+        FROM t_user_group ug
+        JOIN group_hierarchy gh ON ug.group_id = gh.id
+        WHERE ug.group_id = NEW.id;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        WITH RECURSIVE group_hierarchy AS (
+            SELECT id, parent_id
+            FROM t_group
+            WHERE id = OLD.id
+
+            UNION ALL
+
+            SELECT g.id, g.parent_id
+            FROM t_group g
+            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
+        )
+        DELETE FROM t_user_group_hierarchy
+        WHERE group_id IN (SELECT id FROM group_hierarchy);
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER maintain_group_hierarchy_consistency_trigger
+AFTER INSERT OR DELETE ON t_group
+FOR EACH ROW EXECUTE FUNCTION maintain_group_hierarchy_consistency();
