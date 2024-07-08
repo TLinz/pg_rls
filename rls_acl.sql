@@ -21,10 +21,9 @@ RETURNS TRIGGER AS $$
 DECLARE
   v_parent_acl ace_uuid[];
 BEGIN
-  -- SELECT acl INTO v_parent_acl FROM t_artist WHERE id = NEW.artist_id; -- bug! [22P02] ERROR: missing "=" sign
   raise notice 'new artist id is %', NEW.artist_id;
   v_parent_acl = (SELECT p.acl FROM t_artist p WHERE p.id = NEW.artist_id);
-  -- v_parent_acl = '314d6bee-42a0-4254-a00d-7362c793a897'::UUID;
+  raise notice 'new artist parent acl is %', v_parent_acl;
   IF v_parent_acl IS NULL THEN
     NEW.acl = NULL;
   ELSE
@@ -32,9 +31,9 @@ BEGIN
       NEW.acl = v_parent_acl;
     ELSE
       NEW.acl = acl_merge(v_parent_acl, NEW.acl, true, true);
+      raise notice 'new artist new acl is %', NEW.acl;
     END IF;
   END IF;
-
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -42,9 +41,6 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER creation_insert
 BEFORE INSERT OR UPDATE ON t_creation
 FOR EACH ROW EXECUTE PROCEDURE creation_modify();
-
-commit;
-
 
 ALTER TABLE t_creation ADD CONSTRAINT fk_artist
 FOREIGN KEY (artist_id)
@@ -96,6 +92,15 @@ BEGIN;
 SET LOCAL app_user.uuid = '2f829c0a-859b-45ea-aaf9-682b5dc505d7';
 INSERT INTO t_creation(id, artist_id, name, acl) values
     (2, '2f829c0a-859b-45ea-aaf9-682b5dc505d7', 'Happy World', '{a//2f829c0a-859b-45ea-aaf9-682b5dc505d7=rw}');
+COMMIT;
+
+set role app_user;
+
+-- Only acl with flag 'c' can be inherited.
+BEGIN;
+SET LOCAL app_user.uuid = '314d6bee-42a0-4254-a00d-7362c793a897';
+INSERT INTO t_creation(id, artist_id, name, acl) values
+    (13, '314d6bee-42a0-4254-a00d-7362c793a897', 'Happy World', '{a//8a8d1cd6-e118-4f51-8ff5-90d67fad897b=w}');
 COMMIT;
 
 BEGIN;
@@ -165,6 +170,7 @@ BEGIN
     IF group_uuids IS NOT NULL AND array_length(group_uuids, 1) > 0 THEN
         FOREACH user_uuid IN ARRAY group_uuids LOOP
             result := acl_check_access(acl, permission, ARRAY[user_uuid], false);
+            raise notice 'user group: %', user_uuid;
             IF result = permission THEN
                 RETURN result;
             END IF;
@@ -181,6 +187,11 @@ USING (acl_check_access_groups(acl, 'r'::text, current_setting('app_user.uuid'):
 INSERT INTO t_group (name) VALUES ('Artists');
 INSERT INTO t_group (name, parent_id) VALUES ('Sculptors', (SELECT id FROM t_group WHERE name = 'Artists'));
 INSERT INTO t_user_group (user_id, group_id) VALUES ('10fc1485-7cc2-42ac-a896-1ac370f5401e', (SELECT id FROM t_group WHERE name = 'Sculptors'));
+
+BEGIN;
+SET LOCAL app_user.uuid = '8a8d1cd6-e118-4f51-8ff5-90d67fad897b';
+select * from t_creation;
+COMMIT;
 
 -- Questions --
 
@@ -202,6 +213,98 @@ INSERT INTO t_user_group (user_id, group_id) VALUES ('10fc1485-7cc2-42ac-a896-1a
 -- 5. Add a trigger to maintain consistency between 't_group' and 't_user_group'.
 
 -- 6. Generic inheritance.
+
+CREATE OR REPLACE FUNCTION update_user_group_hierarchy()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_group_id UUID;
+    v_parent_id UUID;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        v_group_id := NEW.group_id;
+        LOOP
+            SELECT parent_id INTO v_parent_id FROM t_group WHERE id = v_group_id;
+            EXIT WHEN v_parent_id IS NULL;
+
+            INSERT INTO t_user_group (user_id, group_id)
+            VALUES (NEW.user_id, v_parent_id)
+            ON CONFLICT (user_id, group_id) DO NOTHING;
+
+            v_group_id := v_parent_id;
+        END LOOP;
+
+    -- Deletion operations are not synchronized.
+    -- Deletion cascade operations may lead to accidental deletion
+    -- because a parent group may have multiple subgroups.
+
+--     ELSIF TG_OP = 'DELETE' THEN
+--         v_group_id := OLD.group_id;
+--         LOOP
+--             SELECT parent_id INTO v_parent_id FROM t_group WHERE id = v_group_id;
+--             EXIT WHEN v_parent_id IS NULL;
+--
+--             DELETE FROM t_user_group
+--             WHERE user_id = OLD.user_id AND group_id = v_parent_id
+--             AND NOT EXISTS (
+--                 SELECT 1
+--                 FROM t_user_group
+--                 WHERE user_id = OLD.user_id AND group_id = v_group_id
+--             );
+--
+--             v_group_id := v_parent_id;
+--         END LOOP;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- CREATE TRIGGER trg_update_user_group_hierarchy
+-- AFTER INSERT OR DELETE ON t_user_group
+-- FOR EACH ROW EXECUTE FUNCTION update_user_group_hierarchy();
+
+CREATE TRIGGER trg_update_user_group_hierarchy
+AFTER INSERT ON t_user_group
+FOR EACH ROW EXECUTE FUNCTION update_user_group_hierarchy();
+
+CREATE OR REPLACE FUNCTION handle_user_deletion()
+RETURNS TRIGGER AS $$
+BEGIN
+    DELETE FROM t_user_group WHERE user_id = OLD.id;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_handle_user_deletion
+AFTER DELETE ON t_artist
+FOR EACH ROW EXECUTE FUNCTION handle_user_deletion();
+
+-- not very sure.
+    
+-- CREATE OR REPLACE FUNCTION handle_group_deletion()
+-- RETURNS TRIGGER AS $$
+-- DECLARE
+--     v_group_id UUID;
+-- BEGIN
+--     WITH RECURSIVE group_hierarchy AS (
+--         SELECT id FROM t_group WHERE id = OLD.id
+--         UNION ALL
+--         SELECT g.id
+--         FROM t_group g
+--         JOIN group_hierarchy gh ON gh.id = g.parent_id
+--     )
+--     DELETE FROM t_user_group
+--     WHERE group_id IN (SELECT id FROM group_hierarchy);
+--
+--     RETURN OLD;
+-- END;
+-- $$ LANGUAGE plpgsql;
+--
+-- CREATE TRIGGER trg_handle_group_deletion
+-- AFTER DELETE ON t_group
+-- FOR EACH ROW EXECUTE FUNCTION handle_group_deletion();
+
+
 
 -- Add ACL column to t_group table
 ALTER TABLE t_group
@@ -233,141 +336,6 @@ CREATE TRIGGER add_group_acl_trigger
 BEFORE INSERT ON t_creation
 FOR EACH ROW
 EXECUTE FUNCTION add_group_acl();
-
-CREATE OR REPLACE FUNCTION maintain_user_group_consistency()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF TG_OP = 'DELETE' THEN
-        -- Delete corresponding entries in t_user_group when a group is deleted
-        DELETE FROM t_user_group WHERE group_id = OLD.id;
-    ELSIF TG_OP = 'UPDATE' THEN
-        -- Update corresponding entries in t_user_group when a group is modified
-        UPDATE t_user_group SET group_id = NEW.id WHERE group_id = OLD.id;
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- DROP TRIGGER IF EXISTS maintain_user_group_consistency_trigger ON t_group;
-
-CREATE TRIGGER maintain_user_group_consistency_trigger
-AFTER DELETE OR UPDATE ON t_group
-FOR EACH ROW
-EXECUTE FUNCTION maintain_user_group_consistency();
-
--- -- Define a comparison function for ace_uuid type
--- CREATE OR REPLACE FUNCTION ace_uuid_cmp(ace1 ace_uuid, ace2 ace_uuid)
--- RETURNS INTEGER AS $$
--- BEGIN
---     IF ace1 = ace2 THEN
---         RETURN 0;
---     ELSE
---         RETURN 1;
---     END IF;
--- END;
--- $$ LANGUAGE plpgsql;
---
--- -- Create a GIN index using the comparison function
--- CREATE INDEX acl_uuid_gin_index ON t_creation USING GIN (acl);
-
-CREATE TABLE t_user_group_hierarchy (
-    user_id UUID NOT NULL,
-    group_id UUID NOT NULL,
-    PRIMARY KEY (user_id, group_id),
-    FOREIGN KEY (user_id) REFERENCES t_artist(id),
-    FOREIGN KEY (group_id) REFERENCES t_group(id)
-);
-
-CREATE OR REPLACE FUNCTION sync_user_group_hierarchy()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_group_id UUID;
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        WITH RECURSIVE group_hierarchy AS (
-            SELECT id, parent_id
-            FROM t_group
-            WHERE id = NEW.group_id
-
-            UNION ALL
-
-            SELECT g.id, g.parent_id
-            FROM t_group g
-            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
-        )
-        INSERT INTO t_user_group_hierarchy (user_id, group_id)
-        SELECT ug.user_id, gh.id
-        FROM t_user_group ug, group_hierarchy gh
-        WHERE ug.group_id = NEW.group_id;
-    END IF;
-
-    IF TG_OP = 'DELETE' THEN
-        WITH RECURSIVE group_hierarchy AS (
-            SELECT id, parent_id
-            FROM t_group
-            WHERE id = OLD.group_id
-
-            UNION ALL
-
-            SELECT g.id, g.parent_id
-            FROM t_group g
-            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
-        )
-        DELETE FROM t_user_group_hierarchy
-        WHERE user_id = OLD.user_id
-        AND group_id IN (SELECT id FROM group_hierarchy);
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER sync_user_group_hierarchy_trigger
-AFTER INSERT OR DELETE ON t_user_group
-FOR EACH ROW EXECUTE FUNCTION sync_user_group_hierarchy();
-
-CREATE OR REPLACE FUNCTION maintain_group_hierarchy_consistency()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        WITH RECURSIVE group_hierarchy AS (
-            SELECT id, parent_id
-            FROM t_group
-            WHERE id = NEW.id
-
-            UNION ALL
-
-            SELECT g.id, g.parent_id
-            FROM t_group g
-            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
-        )
-        INSERT INTO t_user_group_hierarchy (user_id, group_id)
-        SELECT ug.user_id, gh.id
-        FROM t_user_group ug
-        JOIN group_hierarchy gh ON ug.group_id = gh.id
-        WHERE ug.group_id = NEW.id;
-    END IF;
-
-    IF TG_OP = 'DELETE' THEN
-        WITH RECURSIVE group_hierarchy AS (
-            SELECT id, parent_id
-            FROM t_group
-            WHERE id = OLD.id
-
-            UNION ALL
-
-            SELECT g.id, g.parent_id
-            FROM t_group g
-            INNER JOIN group_hierarchy gh ON gh.parent_id = g.id
-        )
-        DELETE FROM t_user_group_hierarchy
-        WHERE group_id IN (SELECT id FROM group_hierarchy);
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
 
 CREATE TRIGGER maintain_group_hierarchy_consistency_trigger
 AFTER INSERT OR DELETE ON t_group
