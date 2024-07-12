@@ -366,7 +366,3 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_handle_user_group_deletion
 AFTER DELETE ON t_user_group
 FOR EACH ROW EXECUTE FUNCTION handle_user_group_deletion();
-
-CREATE TRIGGER maintain_group_hierarchy_consistency_trigger
-AFTER INSERT OR DELETE ON t_group
-FOR EACH ROW EXECUTE FUNCTION maintain_group_hierarchy_consistency();
