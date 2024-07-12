@@ -280,7 +280,7 @@ AFTER DELETE ON t_artist
 FOR EACH ROW EXECUTE FUNCTION handle_user_deletion();
 
 -- not very sure.
-    
+
 -- CREATE OR REPLACE FUNCTION handle_group_deletion()
 -- RETURNS TRIGGER AS $$
 -- DECLARE
@@ -303,7 +303,6 @@ FOR EACH ROW EXECUTE FUNCTION handle_user_deletion();
 -- CREATE TRIGGER trg_handle_group_deletion
 -- AFTER DELETE ON t_group
 -- FOR EACH ROW EXECUTE FUNCTION handle_group_deletion();
-
 
 
 -- Add ACL column to t_group table
@@ -336,6 +335,37 @@ CREATE TRIGGER add_group_acl_trigger
 BEFORE INSERT ON t_creation
 FOR EACH ROW
 EXECUTE FUNCTION add_group_acl();
+
+CREATE OR REPLACE FUNCTION handle_user_group_deletion()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_group_id UUID;
+    v_child_group_id UUID;
+BEGIN
+    DELETE FROM t_user_group
+    WHERE user_id = OLD.user_id AND group_id = OLD.group_id;
+
+    FOR v_child_group_id IN
+        WITH RECURSIVE child_groups AS (
+            SELECT id FROM t_group WHERE parent_id = OLD.group_id
+            UNION ALL
+            SELECT g.id
+            FROM t_group g
+            JOIN child_groups cg ON g.parent_id = cg.id
+        )
+        SELECT id FROM child_groups
+    LOOP
+        DELETE FROM t_user_group
+        WHERE user_id = OLD.user_id AND group_id = v_child_group_id;
+    END LOOP;
+
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_handle_user_group_deletion
+AFTER DELETE ON t_user_group
+FOR EACH ROW EXECUTE FUNCTION handle_user_group_deletion();
 
 CREATE TRIGGER maintain_group_hierarchy_consistency_trigger
 AFTER INSERT OR DELETE ON t_group
